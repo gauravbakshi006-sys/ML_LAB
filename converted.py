@@ -1,0 +1,536 @@
+# -*- coding: utf-8 -*-
+"""promise.py
+
+Converted from Colab notebook (promise.ipynb) into a plain, runnable Python script.
+Original file was located at:
+    https://colab.research.google.com/drive/1A2FcdpfX_tNgdPGVNJx9AVF4bCWHqfcZ
+
+Notes on conversion:
+- Colab "!shell" lines -> subprocess.run(...)
+- Colab "%cd" magics    -> os.chdir(...)
+- google.colab.files.upload() -> guarded with try/except so this also runs
+  outside Colab (it will just look for the file locally instead).
+- Everything else (logic, variable names, print statements, ordering) is kept
+  exactly as in the original notebook.
+"""
+
+import subprocess
+import os
+
+
+def run(cmd):
+    """Helper to replicate Colab '!cmd' shell-out behavior."""
+    subprocess.run(cmd, shell=True, check=False)
+
+
+# ---------------------------------------------------------------------------
+run("apt-get -qq install openslide-tools")
+run("pip install -q openslide-python wsidicom idc-index")
+
+import numpy as np, pandas as pd, os, random
+
+CANCER_TYPES = {
+    "BLCA": {"cbioportal_study": "blca_tcga_pan_can_atlas_2018", "idc_collection": "tcga_blca"},
+    "LUAD": {"cbioportal_study": "luad_tcga_pan_can_atlas_2018", "idc_collection": "tcga_luad"},
+    "LUSC": {"cbioportal_study": "lusc_tcga_pan_can_atlas_2018", "idc_collection": "tcga_lusc"},
+}
+SIZE_BUDGET_MB_PER_CANCER = 150
+
+import os
+
+gmt_filename = "c2.cp.kegg_legacy.v2026.1.Hs.symbols.gmt"
+
+if not os.path.exists(gmt_filename):
+    print(f"Select your KEGG .gmt file:")
+    try:
+        # Colab-only upload widget
+        from google.colab import files
+        uploaded = files.upload()
+        gmt_filename = list(uploaded.keys())[0]
+    except ImportError:
+        # Not running in Colab -- fall back to expecting the file locally
+        print(
+            f"Not running in Colab: please place '{gmt_filename}' "
+            f"in the working directory ({os.getcwd()}) and re-run."
+        )
+
+kegg_pathways = {}
+with open(gmt_filename) as f:
+    for line in f:
+        parts = line.strip().split("\t")
+        kegg_pathways[parts[0]] = parts[2:]
+
+all_kegg_genes = set()
+for genes in kegg_pathways.values():
+    all_kegg_genes.update(genes)
+
+print(f"Pathways: {len(kegg_pathways)}")
+print(f"Unique genes across all pathways: {len(all_kegg_genes)}")
+print(f"Example: {list(kegg_pathways.keys())[:3]}")
+
+# No -q flag this time, so we see what's actually happening
+run("wget https://cbioportal-datahub.s3.amazonaws.com/blca_tcga_pan_can_atlas_2018.tar.gz")
+print("\n--- files in working dir ---")
+run("ls -la *.tar.gz 2>/dev/null || echo 'no tar.gz files present'")
+
+# Configure LFS to NOT auto-download files (we pull only what we need)
+run("git lfs install --skip-smudge")
+
+if not os.path.exists("/content/datahub"):
+    run("git clone --depth 1 https://github.com/cBioPortal/datahub.git /content/datahub")
+
+os.chdir("/content/datahub")
+run('git -c lfs.fetchexclude="" lfs pull -I public/blca_tcga_pan_can_atlas_2018')
+os.chdir("/content")
+
+# check what we got
+run("ls -la /content/datahub/public/blca_tcga_pan_can_atlas_2018/ | head -20")
+
+os.chdir("/content/datahub")
+
+run(
+    'git -c lfs.fetchexclude="" lfs pull -I '
+    '"public/blca_tcga_pan_can_atlas_2018/data_mrna_seq_v2_rsem.txt,'
+    'public/blca_tcga_pan_can_atlas_2018/data_clinical_patient.txt,'
+    'public/luad_tcga_pan_can_atlas_2018/data_mrna_seq_v2_rsem.txt,'
+    'public/luad_tcga_pan_can_atlas_2018/data_clinical_patient.txt,'
+    'public/lusc_tcga_pan_can_atlas_2018/data_mrna_seq_v2_rsem.txt,'
+    'public/lusc_tcga_pan_can_atlas_2018/data_clinical_patient.txt"'
+)
+
+os.chdir("/content")
+run("ls -la /content/datahub/public/*/data_mrna_seq_v2_rsem.txt")
+
+from sklearn.preprocessing import StandardScaler
+
+DATAHUB = "/content/datahub/public"
+gene_data = {}
+clinical_data = {}
+
+for cancer, cfg in CANCER_TYPES.items():
+    study = cfg["cbioportal_study"]
+    print(f"===== {cancer} =====")
+
+    expr = pd.read_csv(f"{DATAHUB}/{study}/data_mrna_seq_v2_rsem.txt", sep="\t", low_memory=False)
+    print(f"  raw expression: {expr.shape}")
+
+    expr_kegg = expr[expr["Hugo_Symbol"].isin(all_kegg_genes)].drop_duplicates(subset="Hugo_Symbol")
+    print(f"  after KEGG filter: {expr_kegg.shape[0]} genes "
+          f"({len(all_kegg_genes) - expr_kegg.shape[0]} KEGG genes absent)")
+
+    matrix = expr_kegg.set_index("Hugo_Symbol").drop(columns=["Entrez_Gene_Id"]).T
+    matrix.index = matrix.index.str[:12]
+    matrix = matrix.apply(pd.to_numeric, errors="coerce")
+
+    n_nan = matrix.isna().sum().sum()
+    if n_nan:
+        print(f"  NaNs: {n_nan}, filling with 0")
+        matrix = matrix.fillna(0.0)
+
+    log_expr = np.log2(matrix + 1)
+    scaled = pd.DataFrame(StandardScaler().fit_transform(log_expr),
+                          index=log_expr.index, columns=log_expr.columns)
+    gene_data[cancer] = scaled
+
+    clin = pd.read_csv(f"{DATAHUB}/{study}/data_clinical_patient.txt", sep="\t", comment="#")
+    clinical_data[cancer] = clin
+
+    print(f"  FINAL: {scaled.shape[0]} patients x {scaled.shape[1]} genes\n")
+
+
+def build_E_prime(gene_list, kegg_pathways):
+    gene_index = {g: i for i, g in enumerate(gene_list)}
+    pathway_names = sorted(kegg_pathways.keys())
+    E_prime = np.zeros((len(pathway_names), len(gene_list)), dtype=np.float32)
+    for i, pname in enumerate(pathway_names):
+        for g in kegg_pathways[pname]:
+            j = gene_index.get(g)
+            if j is not None:
+                E_prime[i, j] = 1.0
+    return E_prime, pathway_names
+
+
+pathway_matrices = {}
+pathway_names_by_cancer = {}
+
+for cancer, scaled in gene_data.items():
+    E_prime, pnames = build_E_prime(scaled.columns.tolist(), kegg_pathways)
+    pathway_matrices[cancer] = E_prime
+    pathway_names_by_cancer[cancer] = pnames
+    print(f"{cancer}: E' {E_prime.shape} | "
+          f"mean genes/pathway {E_prime.sum(1).mean():.1f} | "
+          f"empty rows {int((E_prime.sum(1)==0).sum())}")
+
+
+def build_pathway_tokens(cancer, patient_id):
+    """E = E' (.) e   ->  (186, n_genes), row m = pathway token Pm"""
+    e = gene_data[cancer].loc[patient_id].values.astype(np.float32)
+    return pathway_matrices[cancer] * e[np.newaxis, :]
+
+
+# verify
+pid = gene_data["BLCA"].index[0]
+E = build_pathway_tokens("BLCA", pid)
+print(f"\nPathway tokens for {pid}: {E.shape}")
+print(f"non-zero: {(E!=0).sum()} / {E.size}")
+
+# sanity check: non-members must be exactly zero
+members = pathway_matrices["BLCA"][0] == 1
+assert np.all(E[0][~members] == 0)
+print("VERIFIED: members keep expression, non-members zeroed")
+
+import pickle, os
+os.makedirs("/content/saved", exist_ok=True)
+
+for cancer in CANCER_TYPES:
+    gene_data[cancer].to_pickle(f"/content/saved/gene_{cancer}.pkl")
+    np.save(f"/content/saved/Eprime_{cancer}.npy", pathway_matrices[cancer])
+
+with open("/content/saved/kegg_pathways.pkl", "wb") as f:
+    pickle.dump(kegg_pathways, f)
+
+print("saved:")
+run("ls -la /content/saved/")
+
+from idc_index import IDCClient
+client = IDCClient.client()
+
+SLIDES_PER_CANCER = 2   # keep tight on time
+
+wsi_manifests = {}
+
+for cancer, cfg in CANCER_TYPES.items():
+    collection = cfg["idc_collection"]
+    results = client.sql_query(f"""
+        SELECT PatientID, SeriesInstanceUID, SeriesDescription, series_size_MB
+        FROM index
+        WHERE collection_id = '{collection}' AND Modality = 'SM'
+    """)
+
+    # keep only patients that ALSO have gene data
+    matched = results[results["PatientID"].isin(set(gene_data[cancer].index))]
+
+    # FFPE diagnostic tumour slides only
+    dx = matched[matched['SeriesDescription'].str.contains('DX', na=False) &
+                 matched['SeriesDescription'].str.contains('TP', na=False)]
+
+    smallest = (dx.sort_values('series_size_MB')
+                  .drop_duplicates(subset='PatientID', keep='first')
+                  .head(SLIDES_PER_CANCER))
+
+    wsi_manifests[cancer] = smallest
+    print(f"{cancer}: {len(dx)} paired slides available | "
+          f"taking {len(smallest)} smallest = {smallest['series_size_MB'].sum():.0f} MB")
+    print(smallest[['PatientID','series_size_MB']].to_string(index=False), "\n")
+
+import os
+
+for cancer, manifest in wsi_manifests.items():
+    out_dir = f"/content/wsi_data/{cancer}"
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"--- {cancer}: {manifest['series_size_MB'].sum():.0f} MB ---")
+    client.download_dicom_series(
+        seriesInstanceUID=manifest["SeriesInstanceUID"].tolist(),
+        downloadDir=out_dir
+    )
+
+run("du -sh /content/wsi_data/*")
+
+import glob
+import numpy as np
+import matplotlib.pyplot as plt
+from wsidicom import WsiDicom
+
+# find any downloaded slide (LUAD is smallest, opens fastest)
+paths = sorted(glob.glob("/content/wsi_data/LUAD/**/*", recursive=True))
+slide_dirs = [p for p in paths if os.path.isdir(p) and glob.glob(p + "/*.dcm")]
+print("candidate slide dirs:", slide_dirs[:3])
+
+slide = WsiDicom.open(slide_dirs[0])
+print("full-res size:", slide.size)
+print("pyramid levels:", len(slide.levels))
+
+# ---------- 1. WSI THUMBNAIL ----------
+thumb = slide.read_thumbnail((800, 800))
+plt.figure(figsize=(7, 7))
+plt.imshow(thumb)
+plt.title(f"Whole Slide Image (full res: {slide.size.width} x {slide.size.height} px)")
+plt.axis("off")
+plt.show()
+
+# ---------- 2. EXTRACT PATCHES ----------
+def has_tissue(patch, threshold=0.8, cutoff=220):
+    gray = np.array(patch.convert("L"))
+    return (gray > cutoff).mean() < threshold
+
+def extract_patches(slide, patch_size=512, stride=512, max_patches=600):
+    W, H = slide.size.width, slide.size.height
+    kept = []
+    for y in range(0, H - patch_size, stride):
+        for x in range(0, W - patch_size, stride):
+            if len(kept) >= max_patches:
+                return kept
+            region = slide.read_region((x, y), 0, (patch_size, patch_size)).convert("RGB")
+            if has_tissue(region):
+                kept.append((x, y, region.resize((256, 256))))
+    return kept
+
+patches = extract_patches(slide)
+print(f"\nExtracted {len(patches)} tissue patches (256x256)")
+
+# ---------- 3. SHOW A GRID OF PATCHES ----------
+n_show = min(16, len(patches))
+fig, axes = plt.subplots(4, 4, figsize=(10, 10))
+for ax, (x, y, img) in zip(axes.ravel(), patches[:n_show]):
+    ax.imshow(img)
+    ax.set_title(f"({x},{y})", fontsize=7)
+    ax.axis("off")
+for ax in axes.ravel()[n_show:]:
+    ax.axis("off")
+plt.suptitle("Extracted 256x256 patches", fontsize=13)
+plt.tight_layout()
+plt.show()
+
+import torch, random
+from torchvision import transforms
+from sklearn.cluster import KMeans
+
+# ---------- re-extract at 256 stride for enough patches ----------
+def extract_patches_dense(slide, patch_size=256, stride=256, max_patches=2000):
+    W, H = slide.size.width, slide.size.height
+    kept = []
+    for y in range(0, H - patch_size, stride):
+        for x in range(0, W - patch_size, stride):
+            if len(kept) >= max_patches:
+                return kept
+            region = slide.read_region((x, y), 0, (patch_size, patch_size)).convert("RGB")
+            if has_tissue(region):
+                kept.append((x, y, region))
+    return kept
+
+patches = extract_patches_dense(slide)
+print(f"Extracted {len(patches)} tissue patches at 256x256")
+
+# ---------- DINO embedding ----------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dino = torch.hub.load('facebookresearch/dino:main', 'dino_vits8').eval().to(device)
+preprocess = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+])
+
+def embed_patches(patches, bs=32):
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(patches), bs):
+            imgs = torch.stack([preprocess(p[2]) for p in patches[i:i+bs]]).to(device)
+            out.append(dino(imgs).cpu().numpy())
+    return np.concatenate(out, axis=0)
+
+embeddings = embed_patches(patches)
+print(f"DINO embeddings: {embeddings.shape}")   # (N, 384)
+
+# ---------- K-means K=50 ----------
+K = min(50, len(embeddings))
+kmeans = KMeans(n_clusters=K, n_init=20, random_state=42)
+labels = kmeans.fit_predict(embeddings)
+print(f"Clusters: {K}")
+
+# ---------- select S=10 per cluster ----------
+random.seed(42)
+selected_idx = []
+for c in range(K):
+    idx = np.where(labels == c)[0]
+    if len(idx) == 0:
+        continue
+    selected_idx.extend(random.sample(list(idx), min(10, len(idx))))
+selected_idx = np.array(selected_idx)
+
+wsi_branch_input = embeddings[selected_idx]
+print(f"\nWSI BRANCH INPUT: {wsi_branch_input.shape}   (paper target: 500 x 384)")
+
+# ---------- VISUAL: spatial cluster map ----------
+xs = np.array([p[0] for p in patches])
+ys = np.array([p[1] for p in patches])
+
+plt.figure(figsize=(13,6))
+plt.scatter(xs, ys, c=labels, cmap='tab20', s=45, marker='s')
+plt.gca().invert_yaxis()
+plt.title(f"K-means patch clustering (K={K}) mapped back onto WSI coordinates")
+plt.xlabel("x (px)"); plt.ylabel("y (px)")
+plt.colorbar(label="cluster id")
+plt.show()
+
+# ---------- VISUAL: one patch from each of 8 clusters ----------
+fig, axes = plt.subplots(2, 4, figsize=(12,6))
+for ax, c in zip(axes.ravel(), range(8)):
+    idx = np.where(labels == c)[0]
+    if len(idx):
+        ax.imshow(patches[idx[0]][2]); ax.set_title(f"cluster {c}", fontsize=9)
+    ax.axis("off")
+plt.suptitle("Representative patch from each of 8 clusters", fontsize=13)
+plt.tight_layout(); plt.show()
+
+import time, torch, numpy as np
+from torchvision import transforms
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("DEVICE:", device)
+
+# ViT-S/16 at 224px = 196 tokens vs vits8 at 256px = 1024 tokens (~5x faster)
+dino16 = torch.hub.load('facebookresearch/dino:main', 'dino_vits16').eval().to(device)
+
+preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+])
+
+# --- time 16 patches to extrapolate ---
+t0 = time.time()
+with torch.no_grad():
+    test = torch.stack([preprocess(p[2]) for p in patches[:16]]).to(device)
+    _ = dino16(test)
+dt = time.time() - t0
+print(f"16 patches took {dt:.1f}s  ->  480 patches ~= {dt*30:.0f}s")
+
+def embed_all(patches, bs=16):
+    out = []
+    with torch.no_grad():
+        for i in range(0, len(patches), bs):
+            imgs = torch.stack([preprocess(p[2]) for p in patches[i:i+bs]]).to(device)
+            out.append(dino16(imgs).cpu().numpy())
+            print(f"  {min(i+bs,len(patches))}/{len(patches)}", end="\r")
+    return np.concatenate(out, axis=0)
+
+embeddings = embed_all(patches)
+print(f"\nDINO embeddings: {embeddings.shape}")
+
+import glob, os
+from wsidicom import WsiDicom
+
+# ---------- A. pick the highest-resolution downloaded slide ----------
+info = []
+for cancer in CANCER_TYPES:
+    for p in glob.glob(f"/content/wsi_data/{cancer}/**/*", recursive=True):
+        if os.path.isdir(p) and glob.glob(p + "/*.dcm"):
+            try:
+                s = WsiDicom.open(p)
+                info.append((cancer, p, s.size.width, s.size.height,
+                             s.size.width * s.size.height))
+                print(f"{cancer}: {s.size.width:>7} x {s.size.height:<7} = "
+                      f"{s.size.width*s.size.height/1e6:6.1f} MP")
+                s.close()
+            except Exception:
+                pass
+
+best = max(info, key=lambda r: r[4])
+print(f"\nSELECTED: {best[0]}  {best[2]} x {best[3]}  ({best[4]/1e6:.1f} MP)")
+slide = WsiDicom.open(best[1])
+
+# ---------- B. saturation-based tissue detection ----------
+def tissue_score(patch):
+    """H&E tissue is coloured; background is grey/white whatever its brightness."""
+    hsv = np.array(patch.convert("HSV"))
+    sat, val = hsv[:, :, 1], hsv[:, :, 2]
+    return ((sat > 25) & (val < 235)).mean()
+
+# ---------- C. extract, sampling randomly across the whole slide ----------
+def extract_tissue_patches(slide, patch_size=256, min_tissue=0.6, target=600, seed=42):
+    W, H = slide.size.width, slide.size.height
+    coords = [(x, y) for y in range(0, H - patch_size, patch_size)
+                     for x in range(0, W - patch_size, patch_size)]
+    np.random.default_rng(seed).shuffle(coords)
+    print(f"grid: {len(coords)} candidate positions")
+
+    kept = []
+    for i, (x, y) in enumerate(coords):
+        if len(kept) >= target:
+            break
+        region = slide.read_region((x, y), 0, (patch_size, patch_size)).convert("RGB")
+        if tissue_score(region) >= min_tissue:
+            kept.append((x, y, region))
+        if i % 100 == 0:
+            print(f"  scanned {i}, kept {len(kept)}", end="\r")
+    return kept
+
+patches = extract_tissue_patches(slide)
+print(f"\nkept {len(patches)} tissue patches")
+
+# ---------- D. verify visually BEFORE embedding ----------
+fig, axes = plt.subplots(3, 6, figsize=(15, 8))
+for ax, (x, y, img) in zip(axes.ravel(), patches[:18]):
+    ax.imshow(img)
+    ax.set_title(f"sat={tissue_score(img):.2f}", fontsize=7)
+    ax.axis("off")
+plt.suptitle("Tissue patches after saturation filtering", fontsize=13)
+plt.tight_layout(); plt.show()
+
+embeddings = embed_all(patches)
+print(f"DINO embeddings: {embeddings.shape}")
+
+K = min(50, len(embeddings))
+kmeans = KMeans(n_clusters=K, n_init=20, random_state=42)
+labels = kmeans.fit_predict(embeddings)
+
+random.seed(42)
+selected_idx = []
+for c in range(K):
+    idx = np.where(labels == c)[0]
+    if len(idx):
+        selected_idx.extend(random.sample(list(idx), min(10, len(idx))))
+selected_idx = np.array(selected_idx)
+
+wsi_branch_input = embeddings[selected_idx]
+print(f"Clusters: {K}")
+print(f"Cluster sizes: min={np.bincount(labels).min()}, "
+      f"max={np.bincount(labels).max()}, mean={np.bincount(labels).mean():.1f}")
+print(f"\nWSI BRANCH INPUT: {wsi_branch_input.shape}   (paper: 500 x 384)")
+
+# spatial map
+xs = np.array([p[0] for p in patches])
+ys = np.array([p[1] for p in patches])
+plt.figure(figsize=(12,9))
+plt.scatter(xs, ys, c=labels, cmap='tab20', s=25, marker='s')
+plt.gca().invert_yaxis()
+plt.title(f"K-means patch clustering (K={K}) on TCGA-BLCA WSI (36451 x 27841)")
+plt.xlabel("x (px)"); plt.ylabel("y (px)")
+plt.colorbar(label="cluster id")
+plt.show()
+
+# representative patch per cluster
+fig, axes = plt.subplots(2, 6, figsize=(15,5.5))
+for ax, c in zip(axes.ravel(), range(12)):
+    idx = np.where(labels == c)[0]
+    if len(idx):
+        ax.imshow(patches[idx[0]][2])
+        ax.set_title(f"cluster {c}  (n={len(idx)})", fontsize=8)
+    ax.axis("off")
+plt.suptitle("Representative patch per cluster", fontsize=13)
+plt.tight_layout(); plt.show()
+
+best_cancer = best[0]
+patient_id  = best[1].split("/")[-3]
+
+print(f"Slide: {patient_id}  ({best_cancer})")
+print(f"Available in gene data: {patient_id in gene_data[best_cancer].index}")
+
+E = build_pathway_tokens(best_cancer, patient_id)
+
+print("\n" + "="*55)
+print("PAMT INPUT PAIR (Sections III-A + III-B)")
+print("="*55)
+print(f"  Patient          : {patient_id}")
+print(f"  GENE branch input: {E.shape}   (186 pathway tokens)")
+print(f"  WSI  branch input: {wsi_branch_input.shape}   (patch tokens, 384-d DINO)")
+print("="*55)
+
+np.save("/content/saved/gene_tokens.npy", E)
+np.save("/content/saved/wsi_tokens.npy", wsi_branch_input)
+print("\nsaved both branch inputs")
+
+# paired-cohort counts across all three cancer types
+print("\nPaired patients available per cancer type:")
+for cancer in CANCER_TYPES:
+    n = len(set(gene_data[cancer].index) & set(wsi_manifests[cancer]["PatientID"]))
+    print(f"  {cancer}: {n} downloaded slides paired with gene data")
